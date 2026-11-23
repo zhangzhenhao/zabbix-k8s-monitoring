@@ -1,0 +1,831 @@
+zabbix_export:
+  version: '7.0'
+  template_groups:
+    - uuid: a571c0d144b14fd4a87a9d9b2aa9fcd6
+      name: Templates/Applications
+  templates:
+    - uuid: 840170d6da054f05abe4eb75fa7550e5
+      template: 'Kubernetes Alertmanager by HTTP'
+      name: 'Kubernetes Alertmanager by HTTP'
+      description: |
+        ## 概览
+        该模板通过 HTTP agent 周期拉取 Kubernetes Alertmanager（v2 API）中的活跃告警，
+        把每条告警映射为 Zabbix 中的一个独立 problem（LLD 发现 + trigger prototype），
+        后续告警展示、通知、升级完全使用 Zabbix 原生的 Problems / Actions / Media types 能力。
+        
+        数据源：`{$ALERTMANAGER.URL}/api/v2/alerts?{$ALERTMANAGER.ALERT_FILTER_QUERY}`
+        
+        ## 实现方式
+        1. Master item `am.alerts.raw` 拉取 Alertmanager 告警 JSON，并用 JavaScript 预处理：
+           - 只保留 `status.state=active` 的告警；
+           - 按 `fingerprint` 去重（同一告警可能因多个 receiver 重复返回）；
+           - 归一化 label / annotation 字段，并按 severity 分桶（critical/error/warning/info/other）。
+        2. 每个 severity 桶对应一个 dependent LLD rule，以 `fingerprint` 为发现维度。
+        3. 每个发现出的告警对应一个数值 item：1=告警存在，0=告警已消失（恢复）。
+        4. Trigger prototype 表达式为 `last(...)=1`，告警从 Alertmanager 消失后 item 取值变为 0，problem 自动恢复。
+        
+        ## Severity 映射
+        Alertmanager severity -> Zabbix trigger priority：
+        - critical -> Disaster
+        - error -> High
+        - warning -> Average
+        - info -> Warning
+        - 其他/缺失 -> Information
+        
+        > Zabbix 的 trigger 优先级不支持 LLD 宏，因此按 severity 拆分为 5 条 LLD 规则实现精确映射。
+        
+        ## 宏
+        - {$ALERTMANAGER.URL}：Alertmanager 地址（默认集群内 Service）
+        - {$ALERTMANAGER.ALERT_FILTER_QUERY}：告警查询参数
+        - {$ALERTMANAGER.POLL_INTERVAL}：拉取间隔
+        - {$ALERTMANAGER.NODATA_PERIOD}：无数据判定阈值
+        
+        ## 限制
+        - label/annotation 以 LLD 宏形式写入 trigger 名称与描述，未单独展开为 item；
+        - 每条告警一个 trigger，告警量大时请评估 Zabbix 的 LLD/trigger 规模；
+        - 若 Alertmanager 开启了 HTTP Basic Auth，需要在 master item 上手工启用认证。
+      groups:
+        - name: Templates/Applications
+      items:
+        - uuid: 7f1ce48dc3a34f56af84297ab8aaf8e4
+          name: 'Alertmanager: active alerts (raw)'
+          type: HTTP_AGENT
+          key: am.alerts.raw
+          delay: '{$ALERTMANAGER.POLL_INTERVAL}'
+          history: 1d
+          value_type: TEXT
+          trends: '0'
+          description: |
+            拉取 Alertmanager 活跃告警原始 JSON，并归一化为：
+            {"total":n,"counts":{...},"groups":{"critical":[...],"error":[...],"warning":[...],"info":[...],"other":[...]}}
+          preprocessing:
+            - type: JAVASCRIPT
+              parameters:
+                - |
+                  var alerts = JSON.parse(value);
+                  var seen = {};
+                  var groups = {critical: [], error: [], warning: [], info: [], other: []};
+                  var counts = {critical: 0, error: 0, warning: 0, info: 0, other: 0};
+                  var total = 0;
+                  var i, a, labels, ann, sev, item;
+                  function str(v) {
+                      return (v === undefined || v === null) ? '' : String(v);
+                  }
+                  function cut(v, n) {
+                      var s = str(v);
+                      return s.length > n ? s.substring(0, n) : s;
+                  }
+                  for (i = 0; i < alerts.length; i++) {
+                      a = alerts[i];
+                      if (!a || !a.status || a.status.state !== 'active' || !a.fingerprint) {
+                          continue;
+                      }
+                      if (seen[a.fingerprint]) {
+                          continue;
+                      }
+                      seen[a.fingerprint] = true;
+                      labels = a.labels || {};
+                      ann = a.annotations || {};
+                      sev = str(labels.severity).toLowerCase();
+                      if (sev !== 'critical' && sev !== 'error' && sev !== 'warning' && sev !== 'info') {
+                          sev = 'other';
+                      }
+                      item = {
+                          FINGERPRINT: str(a.fingerprint),
+                          ALERTNAME: str(labels.alertname),
+                          SEVERITY: str(labels.severity),
+                          NAMESPACE: str(labels.namespace),
+                          POD: str(labels.pod),
+                          INSTANCE: str(labels.instance),
+                          JOB: str(labels.job),
+                          NODE: str(labels.node),
+                          CONTAINER: str(labels.container),
+                          CLUSTER: str(labels.cluster_name || labels.cluster),
+                          TEAM: str(labels.team),
+                          SUMMARY: cut(ann.summary, 200),
+                          DESCRIPTION: cut(ann.description, 300),
+                          RUNBOOK_URL: cut(ann.runbook_url, 150),
+                          STARTS_AT: str(a.startsAt)
+                      };
+                      groups[sev].push(item);
+                      counts[sev] = counts[sev] + 1;
+                      total = total + 1;
+                  }
+                  return JSON.stringify({total: total, counts: counts, groups: groups});
+          timeout: 10s
+          url: '{$ALERTMANAGER.URL}/api/v2/alerts?{$ALERTMANAGER.ALERT_FILTER_QUERY}'
+          tags:
+            - tag: component
+              value: alertmanager
+            - tag: scope
+              value: alerts
+          triggers:
+            - uuid: 7966c874bbcc4ef1b6fdef4643ca67f6
+              expression: 'nodata(/Kubernetes Alertmanager by HTTP/am.alerts.raw,{$ALERTMANAGER.NODATA_PERIOD})=1'
+              name: 'Alertmanager: no alert data received'
+              priority: WARNING
+              description: '超过 {$ALERTMANAGER.NODATA_PERIOD} 未从 Alertmanager 获取到数据，请检查 URL、网络连通性与 Alertmanager 状态。'
+              tags:
+                - tag: scope
+                  value: availability
+      discovery_rules:
+        - uuid: 6704e5c736d94a498093815ca4ece20f
+          name: 'Active K8s alerts (critical)'
+          type: DEPENDENT
+          key: 'am.alerts.discovery[critical]'
+          delay: '0'
+          description: '发现 severity=critical 的活跃告警'
+          lld_macro_paths:
+            - lld_macro: '{#FINGERPRINT}'
+              path: $.FINGERPRINT
+            - lld_macro: '{#ALERTNAME}'
+              path: $.ALERTNAME
+            - lld_macro: '{#SEVERITY}'
+              path: $.SEVERITY
+            - lld_macro: '{#NAMESPACE}'
+              path: $.NAMESPACE
+            - lld_macro: '{#POD}'
+              path: $.POD
+            - lld_macro: '{#INSTANCE}'
+              path: $.INSTANCE
+            - lld_macro: '{#JOB}'
+              path: $.JOB
+            - lld_macro: '{#NODE}'
+              path: $.NODE
+            - lld_macro: '{#CONTAINER}'
+              path: $.CONTAINER
+            - lld_macro: '{#CLUSTER}'
+              path: $.CLUSTER
+            - lld_macro: '{#TEAM}'
+              path: $.TEAM
+            - lld_macro: '{#SUMMARY}'
+              path: $.SUMMARY
+            - lld_macro: '{#DESCRIPTION}'
+              path: $.DESCRIPTION
+            - lld_macro: '{#RUNBOOK_URL}'
+              path: $.RUNBOOK_URL
+            - lld_macro: '{#STARTS_AT}'
+              path: $.STARTS_AT
+          item_prototypes:
+            - uuid: 3c2bf880014a4d048c752c5894325968
+              name: 'Alert detail {#ALERTNAME}'
+              type: DEPENDENT
+              key: 'am.alert.detail.critical[{#FINGERPRINT}]'
+              delay: '0'
+              history: 7d
+              value_type: TEXT
+              trends: '0'
+              description: 告警的归一化明细（labels/annotations/startsAt）
+              preprocessing:
+                - type: JAVASCRIPT
+                  parameters:
+                    - |
+                      var data = JSON.parse(value);
+                      var fp = '{#FINGERPRINT}';
+                      var key, list, i;
+                      for (key in data.groups) {
+                          if (!data.groups.hasOwnProperty(key)) {
+                              continue;
+                          }
+                          list = data.groups[key];
+                          for (i = 0; i < list.length; i++) {
+                              if (list[i].FINGERPRINT === fp) {
+                                  return JSON.stringify(list[i]);
+                              }
+                          }
+                      }
+                      return '{}';
+              master_item:
+                key: am.alerts.raw
+            - uuid: c395cc3498b445f2991eb92a68f7ac8e
+              name: 'Alert state [{#SEVERITY}] {#ALERTNAME}'
+              type: DEPENDENT
+              key: 'am.alert.state.critical[{#FINGERPRINT}]'
+              delay: '0'
+              history: 7d
+              trends: '0'
+              description: '1 = 告警在 Alertmanager 中处于 active 状态，0 = 告警已消失（恢复）'
+              preprocessing:
+                - type: JAVASCRIPT
+                  parameters:
+                    - |
+                      var data = JSON.parse(value);
+                      var fp = '{#FINGERPRINT}';
+                      var key, list, i;
+                      for (key in data.groups) {
+                          if (!data.groups.hasOwnProperty(key)) {
+                              continue;
+                          }
+                          list = data.groups[key];
+                          for (i = 0; i < list.length; i++) {
+                              if (list[i].FINGERPRINT === fp) {
+                                  return 1;
+                              }
+                          }
+                      }
+                      return 0;
+              master_item:
+                key: am.alerts.raw
+              tags:
+                - tag: component
+                  value: alertmanager
+                - tag: severity
+                  value: '{#SEVERITY}'
+              trigger_prototypes:
+                - uuid: eae76950ccec45848b3ec85019e62aa2
+                  expression: 'last(/Kubernetes Alertmanager by HTTP/am.alert.state.critical[{#FINGERPRINT}])=1'
+                  name: 'K8s Alert: {#ALERTNAME} [{#SEVERITY}]'
+                  url: '{#RUNBOOK_URL}'
+                  priority: DISASTER
+                  description: |
+                    {#SUMMARY}
+                    
+                    {#DESCRIPTION}
+                    
+                    namespace: {#NAMESPACE}
+                    pod: {#POD}
+                    instance: {#INSTANCE}
+                    job: {#JOB}
+                    startsAt: {#STARTS_AT}
+                    runbook: {#RUNBOOK_URL}
+                  tags:
+                    - tag: alertname
+                      value: '{#ALERTNAME}'
+                    - tag: namespace
+                      value: '{#NAMESPACE}'
+                    - tag: pod
+                      value: '{#POD}'
+                    - tag: severity
+                      value: '{#SEVERITY}'
+                    - tag: source
+                      value: alertmanager
+          master_item:
+            key: am.alerts.raw
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.groups.critical
+        - uuid: a5c416a0a86444eb820414fba94e4392
+          name: 'Active K8s alerts (error)'
+          type: DEPENDENT
+          key: 'am.alerts.discovery[error]'
+          delay: '0'
+          description: '发现 severity=error 的活跃告警'
+          lld_macro_paths:
+            - lld_macro: '{#FINGERPRINT}'
+              path: $.FINGERPRINT
+            - lld_macro: '{#ALERTNAME}'
+              path: $.ALERTNAME
+            - lld_macro: '{#SEVERITY}'
+              path: $.SEVERITY
+            - lld_macro: '{#NAMESPACE}'
+              path: $.NAMESPACE
+            - lld_macro: '{#POD}'
+              path: $.POD
+            - lld_macro: '{#INSTANCE}'
+              path: $.INSTANCE
+            - lld_macro: '{#JOB}'
+              path: $.JOB
+            - lld_macro: '{#NODE}'
+              path: $.NODE
+            - lld_macro: '{#CONTAINER}'
+              path: $.CONTAINER
+            - lld_macro: '{#CLUSTER}'
+              path: $.CLUSTER
+            - lld_macro: '{#TEAM}'
+              path: $.TEAM
+            - lld_macro: '{#SUMMARY}'
+              path: $.SUMMARY
+            - lld_macro: '{#DESCRIPTION}'
+              path: $.DESCRIPTION
+            - lld_macro: '{#RUNBOOK_URL}'
+              path: $.RUNBOOK_URL
+            - lld_macro: '{#STARTS_AT}'
+              path: $.STARTS_AT
+          item_prototypes:
+            - uuid: 68cbb1afcbde42ce9b131306f32753c4
+              name: 'Alert detail {#ALERTNAME}'
+              type: DEPENDENT
+              key: 'am.alert.detail.error[{#FINGERPRINT}]'
+              delay: '0'
+              history: 7d
+              value_type: TEXT
+              trends: '0'
+              description: 告警的归一化明细（labels/annotations/startsAt）
+              preprocessing:
+                - type: JAVASCRIPT
+                  parameters:
+                    - |
+                      var data = JSON.parse(value);
+                      var fp = '{#FINGERPRINT}';
+                      var key, list, i;
+                      for (key in data.groups) {
+                          if (!data.groups.hasOwnProperty(key)) {
+                              continue;
+                          }
+                          list = data.groups[key];
+                          for (i = 0; i < list.length; i++) {
+                              if (list[i].FINGERPRINT === fp) {
+                                  return JSON.stringify(list[i]);
+                              }
+                          }
+                      }
+                      return '{}';
+              master_item:
+                key: am.alerts.raw
+            - uuid: 3dbe7c6b60324fe09262b78280e5ff17
+              name: 'Alert state [{#SEVERITY}] {#ALERTNAME}'
+              type: DEPENDENT
+              key: 'am.alert.state.error[{#FINGERPRINT}]'
+              delay: '0'
+              history: 7d
+              trends: '0'
+              description: '1 = 告警在 Alertmanager 中处于 active 状态，0 = 告警已消失（恢复）'
+              preprocessing:
+                - type: JAVASCRIPT
+                  parameters:
+                    - |
+                      var data = JSON.parse(value);
+                      var fp = '{#FINGERPRINT}';
+                      var key, list, i;
+                      for (key in data.groups) {
+                          if (!data.groups.hasOwnProperty(key)) {
+                              continue;
+                          }
+                          list = data.groups[key];
+                          for (i = 0; i < list.length; i++) {
+                              if (list[i].FINGERPRINT === fp) {
+                                  return 1;
+                              }
+                          }
+                      }
+                      return 0;
+              master_item:
+                key: am.alerts.raw
+              tags:
+                - tag: component
+                  value: alertmanager
+                - tag: severity
+                  value: '{#SEVERITY}'
+              trigger_prototypes:
+                - uuid: 249d969125d14bbb94e19e175f7e8ce6
+                  expression: 'last(/Kubernetes Alertmanager by HTTP/am.alert.state.error[{#FINGERPRINT}])=1'
+                  name: 'K8s Alert: {#ALERTNAME} [{#SEVERITY}]'
+                  url: '{#RUNBOOK_URL}'
+                  priority: HIGH
+                  description: |
+                    {#SUMMARY}
+                    
+                    {#DESCRIPTION}
+                    
+                    namespace: {#NAMESPACE}
+                    pod: {#POD}
+                    instance: {#INSTANCE}
+                    job: {#JOB}
+                    startsAt: {#STARTS_AT}
+                    runbook: {#RUNBOOK_URL}
+                  tags:
+                    - tag: alertname
+                      value: '{#ALERTNAME}'
+                    - tag: namespace
+                      value: '{#NAMESPACE}'
+                    - tag: pod
+                      value: '{#POD}'
+                    - tag: severity
+                      value: '{#SEVERITY}'
+                    - tag: source
+                      value: alertmanager
+          master_item:
+            key: am.alerts.raw
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.groups.error
+        - uuid: 454ba54686b14dd8b29c887576298bd0
+          name: 'Active K8s alerts (info)'
+          type: DEPENDENT
+          key: 'am.alerts.discovery[info]'
+          delay: '0'
+          description: '发现 severity=info 的活跃告警'
+          lld_macro_paths:
+            - lld_macro: '{#FINGERPRINT}'
+              path: $.FINGERPRINT
+            - lld_macro: '{#ALERTNAME}'
+              path: $.ALERTNAME
+            - lld_macro: '{#SEVERITY}'
+              path: $.SEVERITY
+            - lld_macro: '{#NAMESPACE}'
+              path: $.NAMESPACE
+            - lld_macro: '{#POD}'
+              path: $.POD
+            - lld_macro: '{#INSTANCE}'
+              path: $.INSTANCE
+            - lld_macro: '{#JOB}'
+              path: $.JOB
+            - lld_macro: '{#NODE}'
+              path: $.NODE
+            - lld_macro: '{#CONTAINER}'
+              path: $.CONTAINER
+            - lld_macro: '{#CLUSTER}'
+              path: $.CLUSTER
+            - lld_macro: '{#TEAM}'
+              path: $.TEAM
+            - lld_macro: '{#SUMMARY}'
+              path: $.SUMMARY
+            - lld_macro: '{#DESCRIPTION}'
+              path: $.DESCRIPTION
+            - lld_macro: '{#RUNBOOK_URL}'
+              path: $.RUNBOOK_URL
+            - lld_macro: '{#STARTS_AT}'
+              path: $.STARTS_AT
+          item_prototypes:
+            - uuid: 5d235587e89843ebba2f6f8391556524
+              name: 'Alert detail {#ALERTNAME}'
+              type: DEPENDENT
+              key: 'am.alert.detail.info[{#FINGERPRINT}]'
+              delay: '0'
+              history: 7d
+              value_type: TEXT
+              trends: '0'
+              description: 告警的归一化明细（labels/annotations/startsAt）
+              preprocessing:
+                - type: JAVASCRIPT
+                  parameters:
+                    - |
+                      var data = JSON.parse(value);
+                      var fp = '{#FINGERPRINT}';
+                      var key, list, i;
+                      for (key in data.groups) {
+                          if (!data.groups.hasOwnProperty(key)) {
+                              continue;
+                          }
+                          list = data.groups[key];
+                          for (i = 0; i < list.length; i++) {
+                              if (list[i].FINGERPRINT === fp) {
+                                  return JSON.stringify(list[i]);
+                              }
+                          }
+                      }
+                      return '{}';
+              master_item:
+                key: am.alerts.raw
+            - uuid: a93fffabc8eb4c959e39ee9421b9624a
+              name: 'Alert state [{#SEVERITY}] {#ALERTNAME}'
+              type: DEPENDENT
+              key: 'am.alert.state.info[{#FINGERPRINT}]'
+              delay: '0'
+              history: 7d
+              trends: '0'
+              description: '1 = 告警在 Alertmanager 中处于 active 状态，0 = 告警已消失（恢复）'
+              preprocessing:
+                - type: JAVASCRIPT
+                  parameters:
+                    - |
+                      var data = JSON.parse(value);
+                      var fp = '{#FINGERPRINT}';
+                      var key, list, i;
+                      for (key in data.groups) {
+                          if (!data.groups.hasOwnProperty(key)) {
+                              continue;
+                          }
+                          list = data.groups[key];
+                          for (i = 0; i < list.length; i++) {
+                              if (list[i].FINGERPRINT === fp) {
+                                  return 1;
+                              }
+                          }
+                      }
+                      return 0;
+              master_item:
+                key: am.alerts.raw
+              tags:
+                - tag: component
+                  value: alertmanager
+                - tag: severity
+                  value: '{#SEVERITY}'
+              trigger_prototypes:
+                - uuid: 1c7781439eb64c5987aa4c7ee44feef2
+                  expression: 'last(/Kubernetes Alertmanager by HTTP/am.alert.state.info[{#FINGERPRINT}])=1'
+                  name: 'K8s Alert: {#ALERTNAME} [{#SEVERITY}]'
+                  url: '{#RUNBOOK_URL}'
+                  priority: WARNING
+                  description: |
+                    {#SUMMARY}
+                    
+                    {#DESCRIPTION}
+                    
+                    namespace: {#NAMESPACE}
+                    pod: {#POD}
+                    instance: {#INSTANCE}
+                    job: {#JOB}
+                    startsAt: {#STARTS_AT}
+                    runbook: {#RUNBOOK_URL}
+                  tags:
+                    - tag: alertname
+                      value: '{#ALERTNAME}'
+                    - tag: namespace
+                      value: '{#NAMESPACE}'
+                    - tag: pod
+                      value: '{#POD}'
+                    - tag: severity
+                      value: '{#SEVERITY}'
+                    - tag: source
+                      value: alertmanager
+          master_item:
+            key: am.alerts.raw
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.groups.info
+        - uuid: 1ed9df96bd4042cd9b0f27b46ea55796
+          name: 'Active K8s alerts (other)'
+          type: DEPENDENT
+          key: 'am.alerts.discovery[other]'
+          delay: '0'
+          description: '发现未定义 severity 的活跃告警'
+          lld_macro_paths:
+            - lld_macro: '{#FINGERPRINT}'
+              path: $.FINGERPRINT
+            - lld_macro: '{#ALERTNAME}'
+              path: $.ALERTNAME
+            - lld_macro: '{#SEVERITY}'
+              path: $.SEVERITY
+            - lld_macro: '{#NAMESPACE}'
+              path: $.NAMESPACE
+            - lld_macro: '{#POD}'
+              path: $.POD
+            - lld_macro: '{#INSTANCE}'
+              path: $.INSTANCE
+            - lld_macro: '{#JOB}'
+              path: $.JOB
+            - lld_macro: '{#NODE}'
+              path: $.NODE
+            - lld_macro: '{#CONTAINER}'
+              path: $.CONTAINER
+            - lld_macro: '{#CLUSTER}'
+              path: $.CLUSTER
+            - lld_macro: '{#TEAM}'
+              path: $.TEAM
+            - lld_macro: '{#SUMMARY}'
+              path: $.SUMMARY
+            - lld_macro: '{#DESCRIPTION}'
+              path: $.DESCRIPTION
+            - lld_macro: '{#RUNBOOK_URL}'
+              path: $.RUNBOOK_URL
+            - lld_macro: '{#STARTS_AT}'
+              path: $.STARTS_AT
+          item_prototypes:
+            - uuid: b3498d5d80a942f898ddc8e922a2fec3
+              name: 'Alert detail {#ALERTNAME}'
+              type: DEPENDENT
+              key: 'am.alert.detail.other[{#FINGERPRINT}]'
+              delay: '0'
+              history: 7d
+              value_type: TEXT
+              trends: '0'
+              description: 告警的归一化明细（labels/annotations/startsAt）
+              preprocessing:
+                - type: JAVASCRIPT
+                  parameters:
+                    - |
+                      var data = JSON.parse(value);
+                      var fp = '{#FINGERPRINT}';
+                      var key, list, i;
+                      for (key in data.groups) {
+                          if (!data.groups.hasOwnProperty(key)) {
+                              continue;
+                          }
+                          list = data.groups[key];
+                          for (i = 0; i < list.length; i++) {
+                              if (list[i].FINGERPRINT === fp) {
+                                  return JSON.stringify(list[i]);
+                              }
+                          }
+                      }
+                      return '{}';
+              master_item:
+                key: am.alerts.raw
+            - uuid: 2773ffb961cd44689dceea98db58c8e5
+              name: 'Alert state [{#SEVERITY}] {#ALERTNAME}'
+              type: DEPENDENT
+              key: 'am.alert.state.other[{#FINGERPRINT}]'
+              delay: '0'
+              history: 7d
+              trends: '0'
+              description: '1 = 告警在 Alertmanager 中处于 active 状态，0 = 告警已消失（恢复）'
+              preprocessing:
+                - type: JAVASCRIPT
+                  parameters:
+                    - |
+                      var data = JSON.parse(value);
+                      var fp = '{#FINGERPRINT}';
+                      var key, list, i;
+                      for (key in data.groups) {
+                          if (!data.groups.hasOwnProperty(key)) {
+                              continue;
+                          }
+                          list = data.groups[key];
+                          for (i = 0; i < list.length; i++) {
+                              if (list[i].FINGERPRINT === fp) {
+                                  return 1;
+                              }
+                          }
+                      }
+                      return 0;
+              master_item:
+                key: am.alerts.raw
+              tags:
+                - tag: component
+                  value: alertmanager
+                - tag: severity
+                  value: '{#SEVERITY}'
+              trigger_prototypes:
+                - uuid: c4a0164c72254fc4a47f19d4f22d66ee
+                  expression: 'last(/Kubernetes Alertmanager by HTTP/am.alert.state.other[{#FINGERPRINT}])=1'
+                  name: 'K8s Alert: {#ALERTNAME} [{#SEVERITY}]'
+                  url: '{#RUNBOOK_URL}'
+                  priority: INFO
+                  description: |
+                    {#SUMMARY}
+                    
+                    {#DESCRIPTION}
+                    
+                    namespace: {#NAMESPACE}
+                    pod: {#POD}
+                    instance: {#INSTANCE}
+                    job: {#JOB}
+                    startsAt: {#STARTS_AT}
+                    runbook: {#RUNBOOK_URL}
+                  tags:
+                    - tag: alertname
+                      value: '{#ALERTNAME}'
+                    - tag: namespace
+                      value: '{#NAMESPACE}'
+                    - tag: pod
+                      value: '{#POD}'
+                    - tag: severity
+                      value: '{#SEVERITY}'
+                    - tag: source
+                      value: alertmanager
+          master_item:
+            key: am.alerts.raw
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.groups.other
+        - uuid: f7cd5773c9b0408d99bd6792018eb346
+          name: 'Active K8s alerts (warning)'
+          type: DEPENDENT
+          key: 'am.alerts.discovery[warning]'
+          delay: '0'
+          description: '发现 severity=warning 的活跃告警'
+          lld_macro_paths:
+            - lld_macro: '{#FINGERPRINT}'
+              path: $.FINGERPRINT
+            - lld_macro: '{#ALERTNAME}'
+              path: $.ALERTNAME
+            - lld_macro: '{#SEVERITY}'
+              path: $.SEVERITY
+            - lld_macro: '{#NAMESPACE}'
+              path: $.NAMESPACE
+            - lld_macro: '{#POD}'
+              path: $.POD
+            - lld_macro: '{#INSTANCE}'
+              path: $.INSTANCE
+            - lld_macro: '{#JOB}'
+              path: $.JOB
+            - lld_macro: '{#NODE}'
+              path: $.NODE
+            - lld_macro: '{#CONTAINER}'
+              path: $.CONTAINER
+            - lld_macro: '{#CLUSTER}'
+              path: $.CLUSTER
+            - lld_macro: '{#TEAM}'
+              path: $.TEAM
+            - lld_macro: '{#SUMMARY}'
+              path: $.SUMMARY
+            - lld_macro: '{#DESCRIPTION}'
+              path: $.DESCRIPTION
+            - lld_macro: '{#RUNBOOK_URL}'
+              path: $.RUNBOOK_URL
+            - lld_macro: '{#STARTS_AT}'
+              path: $.STARTS_AT
+          item_prototypes:
+            - uuid: 4e82162689d74d7fbf72361b9c2f6c73
+              name: 'Alert detail {#ALERTNAME}'
+              type: DEPENDENT
+              key: 'am.alert.detail.warning[{#FINGERPRINT}]'
+              delay: '0'
+              history: 7d
+              value_type: TEXT
+              trends: '0'
+              description: 告警的归一化明细（labels/annotations/startsAt）
+              preprocessing:
+                - type: JAVASCRIPT
+                  parameters:
+                    - |
+                      var data = JSON.parse(value);
+                      var fp = '{#FINGERPRINT}';
+                      var key, list, i;
+                      for (key in data.groups) {
+                          if (!data.groups.hasOwnProperty(key)) {
+                              continue;
+                          }
+                          list = data.groups[key];
+                          for (i = 0; i < list.length; i++) {
+                              if (list[i].FINGERPRINT === fp) {
+                                  return JSON.stringify(list[i]);
+                              }
+                          }
+                      }
+                      return '{}';
+              master_item:
+                key: am.alerts.raw
+            - uuid: 29de55909f2f486eb4d428a6c4e5e0fe
+              name: 'Alert state [{#SEVERITY}] {#ALERTNAME}'
+              type: DEPENDENT
+              key: 'am.alert.state.warning[{#FINGERPRINT}]'
+              delay: '0'
+              history: 7d
+              trends: '0'
+              description: '1 = 告警在 Alertmanager 中处于 active 状态，0 = 告警已消失（恢复）'
+              preprocessing:
+                - type: JAVASCRIPT
+                  parameters:
+                    - |
+                      var data = JSON.parse(value);
+                      var fp = '{#FINGERPRINT}';
+                      var key, list, i;
+                      for (key in data.groups) {
+                          if (!data.groups.hasOwnProperty(key)) {
+                              continue;
+                          }
+                          list = data.groups[key];
+                          for (i = 0; i < list.length; i++) {
+                              if (list[i].FINGERPRINT === fp) {
+                                  return 1;
+                              }
+                          }
+                      }
+                      return 0;
+              master_item:
+                key: am.alerts.raw
+              tags:
+                - tag: component
+                  value: alertmanager
+                - tag: severity
+                  value: '{#SEVERITY}'
+              trigger_prototypes:
+                - uuid: 0e83b002ac4e48f7810a627aedc4f08a
+                  expression: 'last(/Kubernetes Alertmanager by HTTP/am.alert.state.warning[{#FINGERPRINT}])=1'
+                  name: 'K8s Alert: {#ALERTNAME} [{#SEVERITY}]'
+                  url: '{#RUNBOOK_URL}'
+                  priority: AVERAGE
+                  description: |
+                    {#SUMMARY}
+                    
+                    {#DESCRIPTION}
+                    
+                    namespace: {#NAMESPACE}
+                    pod: {#POD}
+                    instance: {#INSTANCE}
+                    job: {#JOB}
+                    startsAt: {#STARTS_AT}
+                    runbook: {#RUNBOOK_URL}
+                  tags:
+                    - tag: alertname
+                      value: '{#ALERTNAME}'
+                    - tag: namespace
+                      value: '{#NAMESPACE}'
+                    - tag: pod
+                      value: '{#POD}'
+                    - tag: severity
+                      value: '{#SEVERITY}'
+                    - tag: source
+                      value: alertmanager
+          master_item:
+            key: am.alerts.raw
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.groups.warning
+      tags:
+        - tag: class
+          value: application
+        - tag: provider
+          value: alertmanager
+        - tag: target
+          value: kubernetes
+      macros:
+        - macro: '{$ALERTMANAGER.ALERT_FILTER_QUERY}'
+          value: 'active=true&silenced=false&inhibited=false'
+          description: 'Alertmanager /api/v2/alerts 查询参数'
+        - macro: '{$ALERTMANAGER.NODATA_PERIOD}'
+          value: 10m
+          description: 超过该时间未取到数据则触发可用性告警
+        - macro: '{$ALERTMANAGER.POLL_INTERVAL}'
+          value: 1m
+          description: 告警拉取间隔
+        - macro: '{$ALERTMANAGER.URL}'
+          value: 'http://rancher-monitoring-alertmanager.cattle-monitoring-system.svc:9093'
+          description: 'Alertmanager 基础 URL（不含结尾斜杠）'
